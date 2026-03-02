@@ -14,6 +14,7 @@ import sys
 import html
 from collections import defaultdict
 import pytz
+import httpx
 from replit import db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
@@ -72,10 +73,19 @@ BADGES = {
     'contributor_100': {'name': 'Contributor', 'emoji': '✍️', 'description': 'Sent over 100 messages.'},
     'hero_500': {'name': 'Hero', 'emoji': '🦸', 'description': 'Sent over 500 messages.'},
     'godlike_1000': {'name': 'God-like', 'emoji': '⚡️', 'description': 'Sent over 1,000 messages.'},
-    'weekly_champ': {'name': 'Weekly Champion', 'emoji': '�', 'description': 'Finished #1 in a weekly leaderboard.'},
+    'weekly_champ': {'name': 'Weekly Champion', 'emoji': '👑', 'description': 'Finished #1 in a weekly leaderboard.'},
     'high_quality': {'name': 'High Quality', 'emoji': '✨', 'description': 'Achieved an average quality score of 18+.'},
     'helping_hand': {'name': 'Helping Hand', 'emoji': '🙏', 'description': 'Achieved a helpfulness score of 18+.'},
+    'diamond_hands': {'name': 'Diamond Hands', 'emoji': '💎', 'description': 'Active in the group for 30+ days.'},
 }
+
+# --- CoinGecko API ---
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
+
+# --- SUI Blockchain ---
+SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
+DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
+SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 
 
 # --- Helper Functions ---
@@ -198,6 +208,14 @@ def _get_badges_key(chat_id, user_id):
     """Returns the database key for a user's badges."""
     return f"badges:{chat_id}:{user_id}"
 
+def _get_welcome_key(chat_id):
+    """Returns the database key for the welcome message toggle."""
+    return f"welcome:{chat_id}"
+
+def _get_airdrop_token_key(chat_id):
+    """Returns the database key for the group's airdrop token type."""
+    return f"airdrop_token:{chat_id}"
+
 def get_events_for_month(chat_id, year, month):
     event_dates = set()
     prefix = f"event:{chat_id}:{year}-{str(month).zfill(2)}"
@@ -267,6 +285,18 @@ async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id,
         elif message_count == 1000:
             await award_badge(context, chat_id, user_id, 'godlike_1000')
 
+        # Check for Diamond Hands badge (active for 30+ distinct days)
+        if "first_seen" not in user_stats:
+            user_stats["first_seen"] = date.isoformat()
+            db[stats_key] = user_stats
+        else:
+            first_seen = datetime.datetime.fromisoformat(user_stats["first_seen"])
+            if first_seen.tzinfo is None:
+                first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
+            now = date if date.tzinfo else date.replace(tzinfo=datetime.timezone.utc)
+            if (now - first_seen).days >= 30:
+                await award_badge(context, chat_id, user_id, 'diamond_hands')
+
     except Exception as e:
         logging.error(f"Error storing message from {username} in chat {chat_id}: {e}")
 
@@ -335,6 +365,202 @@ def get_wallet(chat_id, user_id):
 
     wallet_data = db.get(_get_global_wallet_key(user_id_str))
     return wallet_data
+
+
+# --- SUI Airdrop Functions ---
+def get_top_users_by_messages(chat_id, count):
+    """Returns the top N users by message count, with user_id included."""
+    chat_id_str = str(chat_id)
+    all_stats_keys = db.prefix(f"user_stats:{chat_id_str}:")
+    user_counts = []
+    for key in all_stats_keys:
+        try:
+            key_user_id = key.split(":")[-1]
+            stats = db.get(key)
+            if stats and "message_count" in stats:
+                user_counts.append((key_user_id, stats["message_count"]))
+        except (ValueError, IndexError):
+            continue
+    user_counts.sort(key=lambda item: item[1], reverse=True)
+    return user_counts[:count]
+
+
+async def sui_rpc_call(method: str, params: list) -> dict:
+    """Makes a JSON-RPC call to the SUI network."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            SUI_RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if "error" in result:
+            raise Exception(f"SUI RPC error: {result['error']}")
+        return result.get("result")
+
+
+async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
+    """Gets coin objects owned by an address."""
+    params = [owner]
+    if coin_type:
+        params.append(coin_type)
+    return await sui_rpc_call("suix_getCoins", params)
+
+
+async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dict | None:
+    """Builds, signs, and executes a SUI token transfer.
+
+    Uses the SUI `unsafe_paySui` (for native SUI) or `unsafe_pay` (for other coins)
+    RPC methods to build a transaction, then signs and executes it.
+
+    Requires SUI_PRIVATE_KEY environment variable (hex-encoded Ed25519 private key).
+    """
+    import hashlib
+    from nacl.signing import SigningKey
+    import base64
+
+    private_key_hex = os.environ.get("SUI_PRIVATE_KEY")
+    if not private_key_hex:
+        raise ValueError("SUI_PRIVATE_KEY environment variable not set")
+
+    # Derive the sender address from the private key
+    try:
+        signing_key = SigningKey(bytes.fromhex(private_key_hex))
+    except (ValueError, Exception) as e:
+        raise ValueError("Invalid SUI_PRIVATE_KEY format. Expected 64 hex characters (32-byte Ed25519 key).") from e
+    public_key = signing_key.verify_key.encode()
+
+    # SUI address = blake2b(flag_byte + pubkey)[0:32], hex-encoded with 0x prefix
+    addr_hash = hashlib.blake2b(b'\x00' + public_key, digest_size=32).digest()
+    sender_address = "0x" + addr_hash.hex()
+
+    is_sui = coin_type == "0x2::sui::SUI"
+
+    if is_sui:
+        # For native SUI, use unsafe_paySui
+        coins_result = await sui_get_coins(sender_address, "0x2::sui::SUI")
+        coin_ids = [c["coinObjectId"] for c in coins_result.get("data", [])]
+        if not coin_ids:
+            raise ValueError("Bot wallet has no SUI coins for transfer")
+
+        tx_result = await sui_rpc_call("unsafe_paySui", [
+            sender_address,
+            coin_ids,
+            [recipient],
+            [str(amount)],
+            SUI_GAS_BUDGET
+        ])
+    else:
+        # For other coin types, use unsafe_pay
+        coins_result = await sui_get_coins(sender_address, coin_type)
+        coin_ids = [c["coinObjectId"] for c in coins_result.get("data", [])]
+        if not coin_ids:
+            raise ValueError(f"Bot wallet has no coins of type {coin_type}")
+
+        # Need separate gas coins (SUI)
+        gas_result = await sui_get_coins(sender_address, "0x2::sui::SUI")
+        gas_data = gas_result.get("data", [])
+        if not gas_data:
+            raise ValueError("Bot wallet has no SUI for gas")
+        gas_coin = gas_data[0].get("coinObjectId")
+
+        tx_result = await sui_rpc_call("unsafe_pay", [
+            sender_address,
+            coin_ids,
+            [recipient],
+            [str(amount)],
+            gas_coin,
+            SUI_GAS_BUDGET
+        ])
+
+    # Sign the transaction
+    tx_bytes_b64 = tx_result["txBytes"]
+    tx_bytes = base64.b64decode(tx_bytes_b64)
+
+    # Intent message: intent_scope(0) + version(0) + app_id(0) + tx_bytes
+    intent_message = bytes([0, 0, 0]) + tx_bytes
+    digest = hashlib.blake2b(intent_message, digest_size=32).digest()
+
+    # Ed25519 signature
+    signed = signing_key.sign(digest)
+    signature = signed.signature  # 64 bytes
+
+    # Serialized signature: flag(1) + sig(64) + pubkey(32) = 97 bytes
+    serialized_sig = base64.b64encode(bytes([0x00]) + signature + public_key).decode()
+
+    # Execute the transaction
+    exec_result = await sui_rpc_call("sui_executeTransactionBlock", [
+        tx_bytes_b64,
+        [serialized_sig],
+        {"showEffects": True},
+        "WaitForLocalExecution"
+    ])
+
+    return exec_result
+
+
+# --- Price Lookup ---
+async def fetch_crypto_price(symbol: str) -> dict | None:
+    """Fetches cryptocurrency price data from CoinGecko free API."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # First search for the coin by symbol
+            search_resp = await client.get(
+                f"{COINGECKO_API_URL}/search",
+                params={"query": symbol}
+            )
+            search_resp.raise_for_status()
+            coins = search_resp.json().get("coins", [])
+
+            if not coins:
+                return None
+
+            # Use the first match
+            coin_id = coins[0]["id"]
+            coin_name = coins[0]["name"]
+            coin_symbol = coins[0]["symbol"].upper()
+
+            # Fetch price data
+            price_resp = await client.get(
+                f"{COINGECKO_API_URL}/simple/price",
+                params={
+                    "ids": coin_id,
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true",
+                    "include_market_cap": "true",
+                    "include_24hr_vol": "true"
+                }
+            )
+            price_resp.raise_for_status()
+            price_data = price_resp.json().get(coin_id, {})
+
+            if not price_data:
+                return None
+
+            return {
+                "name": coin_name,
+                "symbol": coin_symbol,
+                "price": price_data.get("usd", 0),
+                "change_24h": price_data.get("usd_24h_change", 0),
+                "market_cap": price_data.get("usd_market_cap", 0),
+                "volume_24h": price_data.get("usd_24h_vol", 0),
+            }
+    except Exception as e:
+        logging.error(f"Error fetching price for {symbol}: {e}")
+        return None
+
+
+def format_large_number(num):
+    """Formats large numbers with K/M/B suffixes."""
+    if num is None or num == 0:
+        return "N/A"
+    if num >= 1_000_000_000:
+        return f"${num / 1_000_000_000:.2f}B"
+    if num >= 1_000_000:
+        return f"${num / 1_000_000:.2f}M"
+    if num >= 1_000:
+        return f"${num / 1_000:.2f}K"
+    return f"${num:.2f}"
 
 
 # --- Calendar Feature Functions ---
@@ -549,6 +775,25 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     await store_message_db(context, update.effective_chat.id, user.id, user.username or user.first_name, user.first_name, user.last_name, update.message.text, update.message.date, update.message.reply_to_message is not None, update.message.message_id)
 
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcomes new members joining the group chat, if enabled by admins."""
+    if not update.message or not update.message.new_chat_members:
+        return
+    # Check if welcome messages are enabled for this group (default: off)
+    chat_id = update.effective_chat.id
+    welcome_enabled = db.get(_get_welcome_key(chat_id), False)
+    if not welcome_enabled:
+        return
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            continue
+        name = f"@{member.username}" if member.username else html.escape(member.first_name)
+        welcome_text = (
+            f"👋 Welcome to the group, <b>{name}</b>!\n\n"
+            f"Type /help to see what I can do!"
+        )
+        await update.message.reply_text(welcome_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
 async def _parse_date_range(args):
     if not args: return None, None, None
 
@@ -685,11 +930,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/publicscore - Show a simple leaderboard in the chat (admin).\n"
         "/mystats - See your personal stats for this group.\n"
         "/mybadges - View the badges you've earned.\n"
+        "/allbadges - See all available badges.\n"
         "/copypasta - Create a copypasta based on your message history.\n\n"
+        "<b>💰 Crypto</b>\n"
+        "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
+        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
+        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"
         "/calendar - Manage the group's event calendar (admin).\n"
         "/events - List all upcoming events.\n"
         "/wallet - Submit or check your wallet address.\n"
+        "/setwelcome on|off - Toggle welcome messages (admin).\n"
+        "/settimezone - Set the timezone for event announcements (admin).\n"
     )
     await update.message.reply_text(help_text + FOOTER_HTML, parse_mode='HTML')
     return ConversationHandler.END
@@ -944,6 +1196,228 @@ async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     copypasta = await asyncio.to_thread(generate_copypasta, transcript)
 
     await update.message.reply_text(copypasta)
+
+
+async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to toggle welcome messages on or off."""
+    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("❌ Only administrators can use this command.")
+        return
+
+    if not context.args or context.args[0].lower() not in ('on', 'off'):
+        await update.message.reply_text("Usage: /setwelcome on or /setwelcome off")
+        return
+
+    enabled = context.args[0].lower() == 'on'
+    db[_get_welcome_key(update.effective_chat.id)] = enabled
+    status = "enabled ✅" if enabled else "disabled ❌"
+    await update.message.reply_text(f"Welcome messages have been {status}.")
+
+
+async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to set the airdrop token type for the group."""
+    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("❌ Only administrators can use this command.")
+        return
+
+    if not context.args:
+        current_token = db.get(_get_airdrop_token_key(update.effective_chat.id), DEFAULT_SUI_COIN_TYPE)
+        await update.message.reply_text(
+            f"Current airdrop token: <code>{html.escape(current_token)}</code>\n\n"
+            f"Usage: /settoken &lt;coin_type&gt;\n"
+            f"Example: /settoken 0x2::sui::SUI",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    coin_type = context.args[0].strip()
+    db[_get_airdrop_token_key(update.effective_chat.id)] = coin_type
+    await update.message.reply_text(
+        f"✅ Airdrop token set to: <code>{html.escape(coin_type)}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Airdrops tokens to top users from a /score leaderboard via SUI blockchain.
+
+    Must be used as a reply to a leaderboard message generated by /score.
+    """
+    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("❌ Only administrators can use this command.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: Reply to a /score leaderboard message with:\n"
+            "/airdrop &lt;count&gt; &lt;amount&gt;\n\n"
+            "Example:\n"
+            "1. Run /score 30 days\n"
+            "2. Broadcast the leaderboard to the group\n"
+            "3. Reply to that leaderboard message with /airdrop 10 1000000000\n\n"
+            "<i>Count = number of top leaderboard users to receive tokens.\n"
+            "Amount = token amount per user in smallest unit (e.g. 1000000000 MIST = 1 SUI).</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        count = int(context.args[0])
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Both count and amount must be whole numbers.")
+        return
+
+    if count < 1 or amount < 1:
+        await update.message.reply_text("❌ Count and amount must be positive numbers.")
+        return
+
+    # Must be a reply to a leaderboard message
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❌ Please reply to a /score leaderboard message to use /airdrop.\n\n"
+            "1. Run /score (e.g. /score 30 days)\n"
+            "2. Broadcast the leaderboard to the group\n"
+            "3. Reply to that leaderboard message with /airdrop &lt;count&gt; &lt;amount&gt;",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    replied_msg_id = update.message.reply_to_message.message_id
+    leaderboard_messages = context.chat_data.get('leaderboard_messages', {})
+    leaderboard = leaderboard_messages.get(replied_msg_id)
+
+    if not leaderboard:
+        await update.message.reply_text("❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.")
+        return
+
+    if not os.environ.get("SUI_PRIVATE_KEY"):
+        await update.message.reply_text("❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.")
+        return
+
+    chat_id = update.effective_chat.id
+    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+
+    # Take the top N users from the score-based leaderboard
+    # Leaderboard entries are tuples: (username, metrics_dict, message_count, user_id)
+    top_entries = leaderboard[:count]
+    if not top_entries:
+        await update.message.reply_text("❌ No eligible users found in the leaderboard.")
+        return
+
+    await update.message.reply_text(
+        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to the top {len(top_entries)} users from the leaderboard...",
+        parse_mode=ParseMode.HTML
+    )
+
+    results = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for username, _, msg_count, user_id_str in top_entries:
+        safe_username = html.escape(username)
+
+        # Look up wallet
+        wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
+        if not wallet_data or not wallet_data.get("wallet_address"):
+            results.append(f"⏭️ @{safe_username}: No wallet registered — skipped")
+            skip_count += 1
+            continue
+
+        wallet_address = wallet_data["wallet_address"]
+
+        try:
+            tx_result = await sui_transfer_token(wallet_address, amount, coin_type)
+            tx_digest = tx_result.get("digest", "unknown")
+            results.append(f"✅ @{safe_username}: <code>{tx_digest}</code>")
+            success_count += 1
+        except Exception as e:
+            logging.error(f"Airdrop transfer failed for {username} ({wallet_address}): {e}")
+            results.append(f"❌ @{safe_username}: {html.escape(str(e)[:60])}")
+            fail_count += 1
+
+    results_text = "\n".join(results)
+    summary = (
+        f"🪂 <b>Airdrop Complete</b>\n\n"
+        f"Token: <code>{html.escape(coin_type)}</code>\n"
+        f"Amount per user: {amount}\n"
+        f"✅ Sent: {success_count} | ⏭️ Skipped (no wallet): {skip_count} | ❌ Failed: {fail_count}\n\n"
+        f"<b>Details:</b>\n{results_text}"
+    )
+    await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetches the current price of a cryptocurrency."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /price &lt;symbol&gt;\n"
+            "Example: /price BTC or /price ethereum",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    symbol = context.args[0].strip()
+    await update.message.reply_text(f"🔍 Looking up {html.escape(symbol.upper())}...", parse_mode=ParseMode.HTML)
+
+    price_data = await fetch_crypto_price(symbol)
+
+    if not price_data:
+        await update.message.reply_text(
+            f"❌ Could not find price data for <b>{html.escape(symbol.upper())}</b>. "
+            "Try the full name (e.g., 'bitcoin') or symbol (e.g., 'BTC').",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    change = price_data["change_24h"] or 0
+    change_emoji = "🟢" if change >= 0 else "🔴"
+    price = price_data['price'] or 0
+    price_fmt = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+
+    response = (
+        f"💰 <b>{html.escape(price_data['name'])} ({html.escape(price_data['symbol'])})</b>\n\n"
+        f"<b>Price:</b> {price_fmt}\n"
+        f"{change_emoji} <b>24h Change:</b> {change:+.2f}%\n"
+        f"📊 <b>Market Cap:</b> {format_large_number(price_data['market_cap'])}\n"
+        f"💎 <b>24h Volume:</b> {format_large_number(price_data['volume_24h'])}"
+    )
+
+    await update.message.reply_text(response + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the help message with all available commands."""
+    help_text = (
+        "Hello! I'm an all-in-one community management and leaderboard bot. Here's what I can do:\n\n"
+        "<b>🤖 AI Analysis</b>\n"
+        "/summarize &lt;number&gt; - Get an AI summary of the last number of messages.\n"
+        "/bestof &lt;number&gt; - See the best messages from the last number of posts.\n"
+        "/vibecheck &lt;number&gt; - Check the group's vibe on the last number of messages.\n"
+        "<i>You can add a topic to any of the above, like /summarize 500 bitcoin</i>\n\n"
+        "<b>📊 Stats & Fun</b>\n"
+        "/score - Get a detailed, AI-integrated contribution leaderboard (admin).\n"
+        "/publicscore - Show a simple leaderboard in the chat (admin).\n"
+        "/mystats - See your personal stats for this group.\n"
+        "/mybadges - View the badges you've earned.\n"
+        "/allbadges - See all available badges.\n"
+        "/copypasta - Create a copypasta based on your message history.\n\n"
+        "<b>💰 Crypto</b>\n"
+        "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
+        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
+        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
+        "<b>🗓️ Group Management</b>\n"
+        "/calendar - Manage the group's event calendar (admin).\n"
+        "/events - List all upcoming events.\n"
+        "/wallet - Submit or check your wallet address.\n"
+        "/setwelcome on|off - Toggle welcome messages (admin).\n"
+        "/settimezone - Set the timezone for event announcements (admin).\n"
+    )
+    await update.message.reply_text(help_text + FOOTER_HTML, parse_mode='HTML')
 
 
 async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1266,7 +1740,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_chat_id = user_id if is_private else score_params['chat_id']
             confirm_text = "✅ Leaderboard sent to your private chat!" if is_private else "✅ Leaderboard broadcasted!"
             keyboard = [[InlineKeyboardButton("📄 Download CSV", callback_data=f"export_csv_{user_id}")]]
-            await context.bot.send_message(target_chat_id, leaderboard_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+            sent_msg = await context.bot.send_message(target_chat_id, leaderboard_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+            # Store leaderboard data keyed by message ID so /airdrop can reference it via reply
+            if not is_private:
+                if 'leaderboard_messages' not in context.chat_data:
+                    context.chat_data['leaderboard_messages'] = {}
+                context.chat_data['leaderboard_messages'][sent_msg.message_id] = raw_data
             if csv_data and score_params['export']:
                 await context.bot.send_document(target_chat_id, document=io.BytesIO(csv_data), filename="leaderboard.csv")
             await query.edit_message_text(confirm_text)
@@ -1303,18 +1782,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def setup_bot_commands(application):
     commands = [
         BotCommand("start", "Show help and command list"),
+        BotCommand("help", "Show help and command list"),
         BotCommand("score", "Generate detailed leaderboard (admin only)"),
         BotCommand("publicscore", "Display a simple leaderboard (admin only)"),
         BotCommand("summarize", "AI summary: /summarize <#> [topic]"),
         BotCommand("bestof", "AI digest: /bestof <#>"),
         BotCommand("vibecheck", "AI sentiment: /vibecheck <#> [topic]"),
         BotCommand("copypasta", "Generate a copypasta of your history"),
+        BotCommand("price", "Crypto price: /price <symbol>"),
+        BotCommand("airdrop", "Airdrop tokens: reply to /score with /airdrop <count> <amount>"),
+        BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
         BotCommand("calendar", "View and manage events (admin only)"),
         BotCommand("events", "List all upcoming events"),
         BotCommand("settimezone", "Set timezone for announcements (admin only)"),
+        BotCommand("setwelcome", "Toggle welcome messages (admin)"),
         BotCommand("stats", "Show chat statistics"),
         BotCommand("wallet", "Submit or check your wallet address"),
         BotCommand("cancel", "Cancel current operation")
@@ -1365,6 +1849,11 @@ def main():
     application.add_handler(CommandHandler("bestof", bestof_command))
     application.add_handler(CommandHandler("vibecheck", vibecheck_command))
     application.add_handler(CommandHandler("copypasta", copypasta_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("airdrop", airdrop_command))
+    application.add_handler(CommandHandler("settoken", settoken_command))
+    application.add_handler(CommandHandler("setwelcome", setwelcome_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mybadges", mybadges_command))
     application.add_handler(CommandHandler("allbadges", allbadges_command))
     application.add_handler(CommandHandler("mystats", mystats_command))
@@ -1373,6 +1862,7 @@ def main():
     application.add_handler(CommandHandler("settimezone", set_timezone_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^(score_|export_csv_)"))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
     application.add_error_handler(error_handler)
     application.post_init = setup_bot_commands
