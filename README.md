@@ -67,7 +67,7 @@ pip install -r requirements.txt
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from BotFather |
 | `OPENAI_API_KEY` | Yes | Your OpenAI API key |
-| `SUI_PRIVATE_KEY` | No | Hex-encoded Ed25519 private key for the bot's SUI wallet (required for `/airdrop`) |
+| `SUI_PRIVATE_KEY` | No | Hex-encoded 32-byte Ed25519 private key (64 hex characters) for the bot's SUI wallet (required for `/airdrop`) |
 | `SUI_RPC_URL` | No | SUI JSON-RPC endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
 
 ### Running

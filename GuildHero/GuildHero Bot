@@ -85,6 +85,7 @@ COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 # --- SUI Blockchain ---
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
 DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
+SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 
 
 # --- Helper Functions ---
@@ -423,15 +424,15 @@ async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dic
         raise ValueError("SUI_PRIVATE_KEY environment variable not set")
 
     # Derive the sender address from the private key
-    signing_key = SigningKey(bytes.fromhex(private_key_hex))
+    try:
+        signing_key = SigningKey(bytes.fromhex(private_key_hex))
+    except (ValueError, Exception) as e:
+        raise ValueError("Invalid SUI_PRIVATE_KEY format. Expected 64 hex characters (32-byte Ed25519 key).") from e
     public_key = signing_key.verify_key.encode()
 
     # SUI address = blake2b(flag_byte + pubkey)[0:32], hex-encoded with 0x prefix
     addr_hash = hashlib.blake2b(b'\x00' + public_key, digest_size=32).digest()
     sender_address = "0x" + addr_hash.hex()
-
-    # Get gas budget estimate
-    gas_budget = "50000000"  # 0.05 SUI, generous default
 
     is_sui = coin_type == "0x2::sui::SUI"
 
@@ -447,7 +448,7 @@ async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dic
             coin_ids,
             [recipient],
             [str(amount)],
-            gas_budget
+            SUI_GAS_BUDGET
         ])
     else:
         # For other coin types, use unsafe_pay
@@ -458,9 +459,10 @@ async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dic
 
         # Need separate gas coins (SUI)
         gas_result = await sui_get_coins(sender_address, "0x2::sui::SUI")
-        gas_coin = gas_result.get("data", [{}])[0].get("coinObjectId")
-        if not gas_coin:
+        gas_data = gas_result.get("data", [])
+        if not gas_data:
             raise ValueError("Bot wallet has no SUI for gas")
+        gas_coin = gas_data[0].get("coinObjectId")
 
         tx_result = await sui_rpc_call("unsafe_pay", [
             sender_address,
@@ -468,7 +470,7 @@ async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dic
             [recipient],
             [str(amount)],
             gas_coin,
-            gas_budget
+            SUI_GAS_BUDGET
         ])
 
     # Sign the transaction
@@ -1250,7 +1252,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Usage: /airdrop &lt;count&gt; &lt;amount&gt;\n"
             "Example: /airdrop 10 1000000000\n\n"
             "<i>Count = number of top leaderboard users to receive tokens.\n"
-            "Amount = token amount per user (in smallest unit, e.g. MIST for SUI).</i>",
+            "Amount = token amount per user in smallest unit (e.g. 1000000000 MIST = 1 SUI).</i>",
             parse_mode=ParseMode.HTML
         )
         return
