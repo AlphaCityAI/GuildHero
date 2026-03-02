@@ -76,6 +76,26 @@ pip install -r requirements.txt
 python "GuildHero/GuildHero Bot"
 ```
 
+### SUI Airdrop Setup
+
+The `/airdrop` command uses standard SUI JSON-RPC methods (`unsafe_paySui`, `unsafe_pay`, `sui_executeTransactionBlock`) for native coin transfers. **No custom smart contracts or Move packages need to be deployed** — the bot talks directly to the SUI network's built-in transfer functionality.
+
+To enable airdrops:
+
+1. **Generate an Ed25519 keypair** — you can use the [SUI CLI](https://docs.sui.io/build/install) (`sui keytool generate ed25519`) or any Ed25519 key generator. You need the raw 32-byte private key as 64 hex characters.
+2. **Fund the wallet** — send SUI (or your custom token) to the bot's derived address. The bot derives its address automatically from the private key on each transfer.
+3. **Set `SUI_PRIVATE_KEY`** — add the hex-encoded private key to your environment variables.
+4. **(Optional) Set a custom token** — use `/settoken <coin_type>` in your group to airdrop a token other than native SUI.
+
+**Airdrop workflow:**
+```
+1. Admin runs:  /score 30 days
+2. Admin clicks: "📢 Broadcast in Group"
+3. Admin replies to the leaderboard message with:  /airdrop 10 1000000000
+   → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 users who have registered wallets.
+   → Users without wallets are gracefully skipped.
+```
+
 ## Architecture
 
 The bot is a single-file Python application using:

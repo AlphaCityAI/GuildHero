@@ -399,7 +399,7 @@ async def sui_rpc_call(method: str, params: list) -> dict:
         return result.get("result")
 
 
-async def sui_get_coins(owner: str, coin_type: str = None) -> list:
+async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
     """Gets coin objects owned by an address."""
     params = [owner]
     if coin_type:
