@@ -17,13 +17,12 @@ import pytz
 import httpx
 from replit import db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ChatMemberHandler,
     ContextTypes,
     filters,
     ConversationHandler,
@@ -1160,9 +1159,10 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    change = price_data["change_24h"]
+    change = price_data["change_24h"] or 0
     change_emoji = "🟢" if change >= 0 else "🔴"
-    price_fmt = f"${price_data['price']:,.2f}" if price_data['price'] >= 1 else f"${price_data['price']:.6f}"
+    price = price_data['price'] or 0
+    price_fmt = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
 
     response = (
         f"💰 <b>{html.escape(price_data['name'])} ({html.escape(price_data['symbol'])})</b>\n\n"
