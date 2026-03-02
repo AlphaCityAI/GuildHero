@@ -11,7 +11,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume
-- **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to the top leaderboard users (admin only)
+- **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
 - **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
 
 ### 📊 Leaderboards & Stats
